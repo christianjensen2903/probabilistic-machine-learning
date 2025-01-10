@@ -142,25 +142,9 @@ class ScoreNet(nn.Module):
 class ClassifierFreeDDPM(nn.Module):
 
     def __init__(self, network, T=100, beta_1=1e-4, beta_T=2e-2, drop_prob=0.1):
-        """
-        Initialize Denoising Diffusion Probabilistic Model
-
-        Parameters
-        ----------
-        network: nn.Module
-            The inner neural network used by the diffusion process. Typically a Unet.
-        beta_1: float
-            beta_t value at t=1
-        beta_T: [float]
-            beta_t value at t=T (last step)
-        T: int
-            The number of diffusion steps.
-        """
 
         super(ClassifierFreeDDPM, self).__init__()
 
-        # Normalize time input before evaluating neural network
-        # Reshape input into image format and normalize time value before sending it to network model
         self._network = network
         self.network = lambda x, t, c: (
             self._network(x.reshape(-1, 1, 28, 28), (t.squeeze() / T), c)
@@ -175,51 +159,22 @@ class ClassifierFreeDDPM(nn.Module):
         self.register_buffer("alpha", 1 - self.beta)
         self.register_buffer("alpha_bar", self.alpha.cumprod(dim=0))
 
-    def forward_diffusion(self, x0, t, epsilon):
-        """
-        q(x_t | x_0)
-        Forward diffusion from an input datapoint x0 to an xt at timestep t, provided a N(0,1) noise sample epsilon.
-        Note that we can do this operation in a single step
+    def forward(self, x0, c):
 
-        Parameters
-        ----------
-        x0: torch.tensor
-            x value at t=0 (an input image)
-        t: int
-            step index
-        epsilon:
-            noise sample
+        t = torch.randint(1, self.T, (x0.shape[0], 1)).to(x0.device)
 
-        Returns
-        -------
-        torch.tensor
-            image at timestep t
-        """
+        epsilon = torch.randn_like(x0)
 
         mean = torch.sqrt(self.alpha_bar[t]) * x0
         std = torch.sqrt(1 - self.alpha_bar[t])
+        xt = mean + std * epsilon
 
-        return mean + std * epsilon
+        if random.random() < self.drop_prob:
+            c = None
+
+        return nn.MSELoss()(epsilon, self.network(xt, t, c))
 
     def reverse_diffusion(self, xt, t, epsilon, w, c):
-        """
-        p(x_{t-1} | x_t)
-        Single step in the reverse direction, from x_t (at timestep t) to x_{t-1}, provided a N(0,1) noise sample epsilon.
-
-        Parameters
-        ----------
-        xt: torch.tensor
-            x value at step t
-        t: int
-            step index
-        epsilon:
-            noise sample
-
-        Returns
-        -------
-        torch.tensor
-            image at timestep t-1
-        """
 
         eps = (1 + w) * self.network(xt, t, c) - w * self.network(xt, t, None)
         mean = (
@@ -239,21 +194,7 @@ class ClassifierFreeDDPM(nn.Module):
 
     @torch.no_grad()
     def sample(self, shape, w, c):
-        """
-        Sample from diffusion model (Algorithm 2 in Ho et al, 2020)
 
-        Parameters
-        ----------
-        shape: tuple
-            Specify shape of sampled output. For MNIST: (nsamples, 28*28)
-
-        Returns
-        -------
-        torch.tensor
-            sampled image
-        """
-
-        # Sample xT: Gaussian noise
         xT = torch.randn(shape).to(self.beta.device)
 
         xt = xT
@@ -263,41 +204,6 @@ class ClassifierFreeDDPM(nn.Module):
             xt = self.reverse_diffusion(xt, t, noise, w, c)
 
         return xt
-
-    def elbo_simple(self, x0, c):
-        """
-        ELBO training objective (Algorithm 1 in Ho et al, 2020)
-
-        Parameters
-        ----------
-        x0: torch.tensor
-            Input image
-
-        Returns
-        -------
-        float
-            ELBO value
-        """
-
-        # Sample time step t
-        t = torch.randint(1, self.T, (x0.shape[0], 1)).to(x0.device)
-
-        # Sample noise
-        epsilon = torch.randn_like(x0)
-
-        # TODO: Forward diffusion to produce image at step t
-        xt = self.forward_diffusion(x0, t, epsilon)
-
-        if random.random() < self.drop_prob:
-            c = None
-
-        return -nn.MSELoss(reduction="mean")(epsilon, self.network(xt, t, c))
-
-    def loss(self, x0, c):
-        """
-        Loss function. Just the negative of the ELBO.
-        """
-        return -self.elbo_simple(x0, c).mean()
 
 
 def train(
@@ -310,33 +216,9 @@ def train(
     ema=True,
     per_epoch_callback=None,
 ):
-    """
-    Training loop
 
-    Parameters
-    ----------
-    model: nn.Module
-        Pytorch model
-    optimizer: optim.Optimizer
-        Pytorch optimizer to be used for training
-    scheduler: optim.LRScheduler
-        Pytorch learning rate scheduler
-    dataloader: utils.DataLoader
-        Pytorch dataloader
-    epochs: int
-        Number of epochs to train
-    device: torch.device
-        Pytorch device specification
-    ema: Boolean
-        Whether to activate Exponential Model Averaging
-    per_epoch_callback: function
-        Called at the end of every epoch
-    """
-
-    # Setting seeds to ensure isolation of w in terms of its significants to the generated images
     set_all_seeds(42)
 
-    # Setup progress bar
     total_steps = len(dataloader) * epochs
     progress_bar = tqdm(range(total_steps), desc="Training")
 
@@ -360,7 +242,7 @@ def train(
             x = x.to(device)
             c = c.to(device)
             optimizer.zero_grad()
-            loss = model.loss(x, c)
+            loss = model.forward(x, c)
             loss.backward()
             optimizer.step()
             scheduler.step()
