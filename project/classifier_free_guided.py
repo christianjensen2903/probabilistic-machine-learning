@@ -13,6 +13,7 @@ from util import (
     set_all_seeds,
     ExponentialMovingAverage,
 )
+from classifier import Encoder
 
 
 class ScoreNet(nn.Module):
@@ -141,7 +142,14 @@ class ScoreNet(nn.Module):
 
 class ClassifierFreeDDPM(nn.Module):
 
-    def __init__(self, network, T=100, beta_1=1e-4, beta_T=2e-2, drop_prob=0.1):
+    def __init__(
+        self,
+        network: nn.Module,
+        T: int = 100,
+        beta_1: float = 1e-4,
+        beta_T: float = 2e-2,
+        drop_prob: float = 0.1,
+    ):
 
         super(ClassifierFreeDDPM, self).__init__()
 
@@ -159,7 +167,7 @@ class ClassifierFreeDDPM(nn.Module):
         self.register_buffer("alpha", 1 - self.beta)
         self.register_buffer("alpha_bar", self.alpha.cumprod(dim=0))
 
-    def forward(self, x0, c):
+    def forward(self, x0: torch.Tensor, c: torch.Tensor | None) -> torch.Tensor:
 
         t = torch.randint(1, self.T, (x0.shape[0], 1)).to(x0.device)
 
@@ -174,9 +182,10 @@ class ClassifierFreeDDPM(nn.Module):
 
         return nn.MSELoss()(epsilon, self.network(xt, t, c))
 
-    def reverse_diffusion(self, xt, t, epsilon, w, c):
+    def reverse_diffusion(
+        self, xt: torch.Tensor, t: torch.Tensor, noise: torch.Tensor, eps: torch.Tensor
+    ) -> torch.Tensor:
 
-        eps = (1 + w) * self.network(xt, t, c) - w * self.network(xt, t, None)
         mean = (
             1.0
             / torch.sqrt(self.alpha[t])
@@ -190,18 +199,52 @@ class ClassifierFreeDDPM(nn.Module):
             0,
         )
 
-        return mean + std * epsilon
+        return mean + std * noise
+
+    def get_gradient(
+        self, xt: torch.Tensor, t: torch.Tensor, c: torch.Tensor, classifier: nn.Module
+    ) -> torch.Tensor:
+        with torch.enable_grad():
+            x_in = xt.clone().requires_grad_(True)
+
+            # Get classifier predictions
+            logits = classifier(x_in.reshape(-1, 1, 28, 28), t.squeeze() / self.T)
+            log_probs = F.log_softmax(logits, dim=-1)
+
+            # Select log probability for target class
+            selected_logits = log_probs[range(len(c)), c]
+
+            gradient = torch.autograd.grad(selected_logits.sum(), x_in)[0]
+
+        return gradient
 
     @torch.no_grad()
-    def sample(self, shape, w, c):
-
+    def sample(
+        self,
+        shape: tuple,
+        w: float,
+        c: torch.Tensor,
+        classifier: nn.Module | None = None,
+    ) -> torch.Tensor:
         xT = torch.randn(shape).to(self.beta.device)
 
         xt = xT
-        for t in range(self.T, 0, -1):
-            noise = torch.randn_like(xT) if t > 1 else 0
-            t = torch.tensor(t).expand(xt.shape[0], 1).to(self.beta.device)
-            xt = self.reverse_diffusion(xt, t, noise, w, c)
+        for i in range(self.T, 0, -1):
+            # Convert 0 to a tensor of zeros when i=1
+            noise = torch.randn_like(xT) if i > 1 else torch.zeros_like(xT)
+            t = torch.tensor(i).expand(xt.shape[0], 1).to(self.beta.device)
+
+            if classifier is not None:
+                eps = self.network(xt, t, c) - w * self.get_gradient(
+                    xt, t, c, classifier
+                ) * torch.sqrt(1 - self.alpha_bar[t])
+            else:
+                # eps = (1 + w) * self.network(xt, t, c) - w * self.network(xt, t, None)
+                eps = w * self.network(xt, t, c) - (w - 1) * self.network(
+                    xt, t, None
+                )  # changed 14-01-2025
+
+            xt = self.reverse_diffusion(xt, t, noise, eps)
 
         return xt
 
@@ -265,7 +308,6 @@ def train(
 
 
 if __name__ == "__main__":
-    # setting seeds to ensure consistent runs and in order to isolate the influence of changing the value of w
     set_all_seeds(42)
 
     # Parameters
@@ -275,9 +317,6 @@ if __name__ == "__main__":
     batch_size = 256
     num_classes = 10
 
-    # Rather than treating MNIST images as discrete objects, as done in Ho et al 2020,
-    # we here treat them as continuous input data, by dequantizing the pixel values (adding noise to the input data)
-    # Also note that we map the 0..255 pixel values to [-1, 1], and that we process the 28x28 pixel values as a flattened 784 tensor.
     transform = transforms.Compose(
         [
             transforms.ToTensor(),
@@ -296,45 +335,42 @@ if __name__ == "__main__":
         shuffle=True,
     )
 
-    # Select device
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
-    # Construct Unet
-    # The original ScoreNet expects a function with std for all the
-    # different noise levels, such that the output can be rescaled.
-    # Since we are predicting the noise (rather than the score), we
-    # ignore this rescaling and just set std=1 for all t.
     mnist_unet = ScoreNet((lambda t: torch.ones(1).to(device)), num_classes=num_classes)
 
-    # Construct model
     model = ClassifierFreeDDPM(mnist_unet, T=T).to(device)
 
-    # Construct optimizer
     optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
 
-    # Setup simple scheduler
     scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, 0.9999)
+
+    classifier = Encoder(num_classes)
+
+    classifier.load_state_dict(torch.load("./mnist_unet_model.pth"))
+
+    classifier = classifier.to(device)
 
     def reporter(model):
         """Callback function used for plotting images during training"""
 
-        # Switch to eval mode
         model.eval()
 
         with torch.no_grad():
-            # Plot images
             nsamples = 10
             class_labels = torch.arange(num_classes).repeat_interleave(
                 nsamples // num_classes
             )
 
-            # If n_samples is not divisible by n_classes, pad the class_labels
             if len(class_labels) < nsamples:
                 extra_labels = torch.arange(nsamples % num_classes)
                 class_labels = torch.cat((class_labels, extra_labels))
 
             samples = model.sample(
-                (nsamples, 28 * 28), w=0.3, c=class_labels.to(device)
+                (nsamples, 28 * 28),
+                w=1,
+                c=class_labels.to(device),
+                classifier=classifier,
             ).cpu()
 
             samples = (samples + 1) / 2
@@ -353,6 +389,7 @@ if __name__ == "__main__":
         epochs=epochs,
         device=device,
         ema=True,
+        per_epoch_callback=reporter,
     )
 
     torch.save(model.state_dict(), "classifier_free_model.pth")
